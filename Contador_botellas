@@ -1,0 +1,301 @@
+#include "LPC17xx.h"
+#include "lpc17xx_adc.h"
+#include "lpc17xx_dac.h"
+#include "lpc17xx_timer.h"
+#include "lpc17xx_gpio.h"
+#include "lpc17xx_gpdma.h"
+#include "lpc17xx_pinsel.h"
+#include "lpc17xx_EXTI.h"
+#include "lpc17xx_UART.h"
+
+#include <stdio.h>
+
+#define DAC_MAX_VALUE 1023         // DAC de 10 bits, máximo valor es 1023
+#define SAMPLE_RATE 10000          // Frecuencia de muestreo de 10 kHz
+#define FREQUENCY 1000             // Frecuencia del pitido de 1 kHz
+#define DURATION_MS 200            // Duración del pitido en milisegundos
+
+// Calculamos el tamaño del buffer
+#define NUM_SAMPLES ((SAMPLE_RATE * DURATION_MS) / 1000)
+
+uint32_t dac_buffer[NUM_SAMPLES];  // Buffer de valores para el DAC
+volatile uint8_t Contador = 0;
+
+void configADC(void);
+void configTimer0(void);
+void configTimer1(void);
+void DAC_Init_Config(void);
+void Generar_Senal(void);
+void Sonar(void);
+void DMA_Init_Config(void);
+void configEINT1(void);
+void UART_InitConfig(void);
+
+uint16_t ADCBuffer = 65335 ;  // Buffer para almacenar el valor del ADC mediante DMA
+
+
+int main(void)
+{
+	SystemInit();
+	Generar_Senal();
+	configTimer0();
+	configTimer1();
+	configADC();
+	DAC_Init_Config();
+	configEINT1();
+
+	//fnr habilito interrupciones
+	//NVIC_EnableIRQ(TIMER1_IRQn);
+	NVIC_SetPriority(EINT0_IRQn, 2);
+	NVIC_SetPriority(TIMER1_IRQn, 1);
+	NVIC_SetPriority(TIMER0_IRQn, 4);
+	NVIC_SetPriority(ADC_IRQn, 3);
+	NVIC_EnableIRQ(EINT0_IRQn);
+	NVIC_EnableIRQ(ADC_IRQn);
+
+
+	while(1)
+	{
+
+	}
+
+	return 0;
+}
+
+void EnviarDato(void)
+{
+	// Inicializar la configuración de UART
+	    UART_InitConfig();
+
+	    char buffer[30];  // Buffer para almacenar el texto y el número
+
+	    // Agregar el texto "Botella " al inicio del buffer
+	    strcpy(buffer, "Botella ");
+
+	    // Convertir el valor de Contador a una cadena en ASCII usando uitoa y concatenarlo al buffer
+	    uitoa(Contador, buffer + strlen(buffer), 10);
+
+	    // Agregar el salto de línea
+	    int length = strlen(buffer);
+	    buffer[length] = '\r';    // Retorno de carro
+	    buffer[length + 1] = '\n'; // Nueva línea
+	    buffer[length + 2] = '\0'; // Terminador nulo
+
+	    // Enviar la cadena completa por UART
+	    UART_Send(LPC_UART0, (uint8_t *)buffer, strlen(buffer), BLOCKING);
+}
+
+void configTimer0(void) //fnr: Match no interrumpe a los 10ms
+{
+	TIM_TIMERCFG_Type configTimer;
+	configTimer.PrescaleOption = TIM_PRESCALE_USVAL;
+	configTimer.PrescaleValue = 1000;
+
+
+	TIM_MATCHCFG_Type configMatch;
+	configMatch.IntOnMatch = ENABLE;
+	configMatch.ExtMatchOutputType = TIM_EXTMATCH_NOTHING;
+	configMatch.MatchChannel = 1;
+	configMatch.MatchValue = 10;
+	configMatch.ResetOnMatch = ENABLE;
+	configMatch.StopOnMatch = DISABLE;
+
+	TIM_ConfigMatch(LPC_TIM0, &configMatch);
+	TIM_Init(LPC_TIM0, TIM_TIMER_MODE, &configTimer);
+	TIM_Cmd(LPC_TIM0, ENABLE);
+	TIM_ClearIntPending(LPC_TIM0,TIM_MR1_INT);
+//	NVIC_EnableIRQ(TIMER0_IRQn); // FNR: FALTABA ESTO
+}
+
+void configTimer1(void) //fnr: Match interrumpe a los 100us
+{
+	TIM_TIMERCFG_Type configTimer1;
+	configTimer1.PrescaleOption = TIM_PRESCALE_USVAL;
+	configTimer1.PrescaleValue = 1;
+
+	TIM_MATCHCFG_Type configMatch0;
+	configMatch0.IntOnMatch = ENABLE;
+	configMatch0.ExtMatchOutputType = TIM_EXTMATCH_NOTHING;
+	configMatch0.MatchChannel = 0;
+	configMatch0.MatchValue = 1;
+	configMatch0.ResetOnMatch = ENABLE;
+	configMatch0.StopOnMatch = DISABLE;
+
+	TIM_ConfigMatch(LPC_TIM1, &configMatch0);
+	TIM_Init(LPC_TIM1, TIM_TIMER_MODE, &configTimer1);
+//	NVIC_EnableIRQ(TIMER1_IRQn); fnr habilito por fuera
+	TIM_ClearIntPending(LPC_TIM1,TIM_MR0_INT);
+
+}
+
+void configADC() // fnr: convierte cuando lo indica el timer1 e interrumpe cuando termina
+{
+	LPC_PINCON->PINSEL1 |= (1<<14);  //ADC0 Pin
+	LPC_PINCON->PINMODE1 |= (1<<15); //Neither
+	//GPIO_SetDir(0,3<<14,1); no es necesario
+	//LPC_GPIO0->FIOMASK |= ~(3<<14); no es necesario
+
+	ADC_Init(LPC_ADC, 200000);
+	ADC_BurstCmd(LPC_ADC, ENABLE);
+	//ADC_StartCmd(LPC_ADC, ADC_START_ON_MAT01);
+	ADC_ChannelCmd(LPC_ADC, 0, ENABLE);
+	ADC_ChannelCmd(LPC_ADC, 0, ENABLE);
+	//ADC_EdgeStartConfig(LPC_ADC, ADC_START_ON_RISING); fnr no se pa que
+	// No necesitamos interrupciones de ADC ya que usaremos DMA
+	ADC_IntConfig(LPC_ADC, ADC_ADINTEN0, ENABLE);
+
+}
+
+void DAC_Init_Config(void){
+	//Configuracion de pin de DAC
+	PINSEL_CFG_Type pinDAC;
+	pinDAC.Portnum = 0;
+	pinDAC.Pinnum = 26;
+	pinDAC.Funcnum = 2;
+	pinDAC.Pinmode = PINSEL_PINMODE_TRISTATE;
+	pinDAC.OpenDrain = PINSEL_PINMODE_NORMAL;
+	PINSEL_ConfigPin(&pinDAC);
+	//GPIO_SetDir(0, 3<<20, 1); fnr no es necesario
+
+	//Configuracion de Periferico DAC
+	DAC_CONVERTER_CFG_Type DAC;
+	DAC.CNT_ENA = DISABLE;
+	DAC.DBLBUF_ENA = DISABLE;
+	DAC.DMA_ENA = DISABLE;
+
+	DAC_ConfigDAConverterControl(LPC_DAC, &DAC);
+	DAC_SetBias(LPC_DAC, 0); //700uA
+	DAC_Init(LPC_DAC);
+
+}
+
+void ADC_IRQHandler(){
+	DMA_Init_Config();
+	if (ADC_ChannelGetStatus(LPC_ADC, 0, ADC_DATA_DONE)) {
+
+		TIM_ClearIntPending(LPC_TIM0,TIM_MR1_INT);//fnr limpa bandera de interrupcion TIM0
+	}
+}
+
+void TIMER1_IRQHandler(){
+static int cont = 0;
+static int i = 0;
+	DAC_UpdateValue(LPC_DAC, dac_buffer[i]*ADCBuffer/65536);
+	i++;
+	if(i==NUM_SAMPLES){
+		i=0;
+		cont++;
+	}
+	if(cont==100){
+		cont = 0;
+		TIM_Cmd(LPC_TIM1, DISABLE);
+		NVIC_DisableIRQ(TIMER1_IRQn);
+		TIM_ClearIntPending(LPC_TIM1,TIM_MR0_INT);
+		NVIC_EnableIRQ(EINT1_IRQn);
+
+	}
+}
+
+void Sonar(void) {// Función que configura y produce el pitido
+
+
+	TIM_Cmd(LPC_TIM1, ENABLE);
+	NVIC_EnableIRQ(TIMER1_IRQn);
+
+}
+
+void Generar_Senal(void){
+	for (uint32_t i = 0; i < NUM_SAMPLES; i++) {
+	        if (i < NUM_SAMPLES / 2) {
+	            dac_buffer[i] = DAC_MAX_VALUE; // Mitad del periodo en alto
+	        } else {
+	            dac_buffer[i] = 0; // Mitad del periodo en bajo
+	        }
+	    }
+}
+
+void DMA_Init_Config(void) {
+
+	// Configuración del DMA para enviar datos al DAC
+	GPDMA_Init();
+
+	GPDMA_Channel_CFG_Type dmaConfig;
+	dmaConfig.ChannelNum = 0;
+	dmaConfig.DstMemAddr = (uint32_t)&ADCBuffer;
+	dmaConfig.TransferSize = 1;
+	dmaConfig.TransferWidth = 2; //bytes
+	dmaConfig.TransferType = GPDMA_TRANSFERTYPE_P2M;
+	dmaConfig.SrcConn = GPDMA_CONN_ADC;
+	dmaConfig.DMALLI = 0;
+
+	GPDMA_Setup(&dmaConfig);
+	GPDMA_ChannelCmd(0,ENABLE);
+	GPDMA_ClearIntPending(GPDMA_STATCLR_INTERR,0);
+
+}
+
+void configEINT1() {
+
+
+	PINSEL_CFG_Type EI1;
+	EI1.Portnum = 2;
+	EI1.Pinnum = 11;
+	EI1.Funcnum = 1;
+	EI1.Pinmode = PINSEL_PINMODE_PULLDOWN;
+	PINSEL_ConfigPin(&EI1);
+	GPIO_SetDir(2,(3<<22), 0);
+
+	EXTI_InitTypeDef EICfg;
+	EICfg.EXTI_Line = EXTI_EINT1;
+	EICfg.EXTI_Mode = EXTI_MODE_EDGE_SENSITIVE;
+	EICfg.EXTI_polarity = EXTI_POLARITY_LOW_ACTIVE_OR_FALLING_EDGE;
+
+	EXTI_Config(&EICfg);
+	EXTI_ClearEXTIFlag(EXTI_EINT1);
+    // Habilitar interrupción en el NVIC para EINT1
+    NVIC_EnableIRQ(EINT1_IRQn);
+
+}
+
+// Rutina de Interrupción para EINT0
+void EINT1_IRQHandler(void) {
+    // Limpiar la bandera de interrupción para EINT0
+	NVIC_DisableIRQ(ADC_IRQn);
+	NVIC_DisableIRQ(TIMER1_IRQn);
+	NVIC_DisableIRQ(EINT1_IRQn);
+    Sonar();
+    LPC_SC->EXTINT |= (1 << 1);  // Limpiar la bandera de EINT1 escribiendo un 1 en EXTINT[1]
+    NVIC_EnableIRQ(ADC_IRQn);
+    Contador++;
+    EnviarDato();
+    for(int i =0;i<500000;i++);
+
+
+}
+
+void UART_InitConfig(void)
+{
+    // Configuración de pines para UART0
+    PINSEL_CFG_Type PinCfg;
+    PinCfg.Funcnum = 1;        // Función UART
+    PinCfg.OpenDrain = 0;
+    PinCfg.Pinmode = 0;
+    PinCfg.Portnum = 0;
+    PinCfg.Pinnum = 2;         // TXD0
+    PINSEL_ConfigPin(&PinCfg);
+    PinCfg.Pinnum = 3;         // RXD0
+    PINSEL_ConfigPin(&PinCfg);
+
+    // Configuración de UART
+    UART_CFG_Type UARTConfigStruct;
+    UART_ConfigStructInit(&UARTConfigStruct);  // Valores predeterminados: 9600bps, 8-N-1
+    UART_Init(LPC_UART0, &UARTConfigStruct);   // Inicializar UART0 con esta configuración
+
+    // Configuración de FIFO
+    UART_FIFO_CFG_Type UARTFIFOConfigStruct;
+    UART_FIFOConfigStructInit(&UARTFIFOConfigStruct);
+    UART_FIFOConfig(LPC_UART0, &UARTFIFOConfigStruct);
+
+    // Habilitar transmisión UART
+    UART_TxCmd(LPC_UART0, ENABLE);
+}
